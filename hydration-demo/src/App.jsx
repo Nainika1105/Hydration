@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from "react";
 
 /* ============================================================================
-   VERTICAL SLICE — Physiologically-Triggered, Receptivity-Aware Hydration Prompting
+   HYDRATION — operational dashboard, vertical slice
    ----------------------------------------------------------------------------
    Implements, end to end, on a synthetic subject:
      L1  deficit tracker        (grey-box water balance)
@@ -15,6 +15,7 @@ import React, { useState, useMemo } from "react";
      - L3 online learning from observed outcomes
      - real sensor input, signal-quality gating, firmware
      - micro-randomisation and the MRT analysis path
+     - manual intake entry (every drink here is bottle-observed)
 ============================================================================ */
 
 /* ---------- deterministic PRNG so runs are reproducible ------------------- */
@@ -31,7 +32,8 @@ const T1 = 22 * 60;       // day ends 22:00
 const STEP = 1;           // minute resolution
 const N = (T1 - T0) / STEP;
 
-const clock = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+const clock = (m) =>
+  `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 
 /* ---------- synthetic subject: activity + environment --------------------- */
 function buildDay({ trainStart, trainLen, peakTemp, humidity, rng }) {
@@ -88,18 +90,22 @@ function receptivity(row, minsSincePrompt) {
   return Math.max(0.03, Math.min(0.95, p));
 }
 
-/* ---------- simulation over one policy ----------------------------------- */
+/* ---------- simulation over one policy -----------------------------------
+   Every decision point writes a row with a reason (invariant I6), which is
+   what the prompt log renders. Logging is pure observation: it does not
+   change what the policy decides.
+-------------------------------------------------------------------------- */
 function simulate(day, cfg, policy, seed) {
   const rng = makeRng(seed);                    // common random numbers across policies
   const coef = { base: cfg.base, k: cfg.k, a: cfg.a, h: cfg.h };
 
   let deficit = 0;                              // mL, positive = behind
   let lastPrompt = -999;
-  let lastDrink = T0;
   let intakeTotal = 0;
   let prompts = 0, answered = 0, floorFires = 0;
   const trace = [];
   const events = [];
+  const decisions = [];
   const hardFloorML = cfg.bodyMass * 1000 * 0.02;   // 2% body mass
 
   // rolling intake for the baseline lapse rule
@@ -114,7 +120,7 @@ function simulate(day, cfg, policy, seed) {
     const rec = receptivity(row, minsSincePrompt);
 
     /* ---- decide whether to prompt ---- */
-    let fire = false, viaFloor = false;
+    let fire = false, viaFloor = false, reason = null;
     const decisionPoint = (row.t - T0) % 30 === 0;
 
     if (policy === "adaptive") {
@@ -122,17 +128,29 @@ function simulate(day, cfg, policy, seed) {
       const projected = deficit + ((sr + INSENSIBLE_LH) * 1000 / 60) * 30;
 
       if (projected >= hardFloorML && minsSincePrompt >= cfg.floorCooldown) {
-        fire = true; viaFloor = true;                      // INVARIANT: unconditional
-      } else if (decisionPoint && projected >= cfg.needThresholdML && minsSincePrompt >= cfg.cooldown) {
-        if (rec >= cfg.recThreshold) fire = true;
-        else if (minsSincePrompt >= cfg.maxDefer) fire = true;   // deferred too long
+        fire = true; viaFloor = true; reason = "floor";     // INVARIANT: unconditional
+      } else if (decisionPoint) {
+        if (projected < cfg.needThresholdML) reason = "nowindow";
+        else if (minsSincePrompt < cfg.cooldown) reason = "cooldown";
+        else if (rec >= cfg.recThreshold) { fire = true; reason = "delivered"; }
+        else if (minsSincePrompt >= cfg.maxDefer) { fire = true; reason = "defercap"; }
+        else reason = "deferred";
       }
     } else {
       // BASELINE: hourly volume-lapse, the sipIT-style rule
       const hourIntake = recent.reduce((a, b) => a + b, 0);
       if (decisionPoint && row.t - lastPrompt >= 60 && hourIntake < cfg.hourlyTargetML) {
-        fire = true;
+        fire = true; reason = "delivered";
+      } else if (decisionPoint) {
+        reason = "nowindow";
       }
+    }
+
+    if (reason) {
+      decisions.push({
+        t: row.t, reason, fired: fire, rec,
+        pctBM: (deficit / (cfg.bodyMass * 1000)) * 100,
+      });
     }
 
     if (fire) {
@@ -155,7 +173,6 @@ function simulate(day, cfg, policy, seed) {
       drankNow = cfg.sipML * (0.6 + 0.8 * rng());
       deficit -= drankNow;
       intakeTotal += drankNow;
-      lastDrink = row.t;
       if (row.t - lastPrompt <= 30) answered++;
       events.push({ t: row.t, kind: "drink", ml: drankNow });
     }
@@ -172,13 +189,20 @@ function simulate(day, cfg, policy, seed) {
     });
   }
 
+  // annotate delivered prompts with the 30-minute proximal outcome
+  const drinks = events.filter((e) => e.kind === "drink");
+  const annotated = decisions.map((d) =>
+    d.fired ? { ...d, drank: drinks.some((e) => e.t >= d.t && e.t <= d.t + 30) } : d
+  );
+
   const thresholdML = cfg.bodyMass * 1000 * 0.01;    // "in deficit" = >1% body mass
   const timeInDeficit = trace.filter((r) => r.deficit > thresholdML).length;
   const peak = Math.max(...trace.map((r) => r.deficit));
 
   return {
-    trace, events, prompts, answered, floorFires,
+    trace, events, decisions: annotated, prompts, answered, floorFires,
     intakeTotal, timeInDeficit, peak,
+    finalPctBM: trace[trace.length - 1].pctBM,
     responseRate: prompts ? answered / prompts : 0,
   };
 }
@@ -187,126 +211,228 @@ function simulate(day, cfg, policy, seed) {
 function checkInvariant(res, cfg) {
   const floorML = cfg.bodyMass * 1000 * 0.02;
   // find minutes where projected deficit crossed the floor
-  const violations = res.trace.filter((r, i) => {
+  const violations = res.trace.filter((r) => {
     if (r.deficit < floorML) return false;
-    // was a prompt fired within the following 15 min?
-    const near = res.events.some((e) => e.t >= r.t && e.t <= r.t + 15 && e.kind !== "drink");
+    // was a prompt fired within the floor cooldown? (a shorter window than the
+    // cooldown itself would flag a policy that is in fact prompting as fast as it may)
+    const w = cfg.floorCooldown + 5;
+    const near = res.events.some((e) => e.t >= r.t - w && e.t <= r.t + w && e.kind !== "drink");
     return !near;
   });
   return violations.length;
 }
 
-/* ============================== UI ======================================= */
+/* ============================== UI =======================================
+   Palette and type mirror the project deck: deep maroon on white, Georgia
+   for headings, one accent (gold) reserved for warnings.
+========================================================================== */
 
 const C = {
-  ground: "#EDF0F2",
-  panel: "#FFFFFF",
-  ink: "#16222E",
-  muted: "#65757F",
-  hair: "#D5DCE1",
-  deficit: "#2C6E8F",
-  floor: "#A83A2C",
-  adaptive: "#2E7D5B",
-  baseline: "#B8892B",
-  drink: "#7FA8BF",
+  maroon:    "#6E1423",
+  maroonDk:  "#470B15",
+  maroonMid: "#8C2233",
+  maroonLt:  "#B03A4B",
+  rose:      "#D99AA3",
+  blush:     "#F8EFF1",
+  blush2:    "#F0DFE3",
+  white:     "#FFFFFF",
+  ink:       "#2A2224",
+  grey:      "#8A7F82",
+  greyLt:    "#C9C0C2",
+  gold:      "#C2943A",
 };
 
+const PANEL_H = 268;
+
+const SERIF = "Georgia, 'Times New Roman', serif";
+const SANS = "system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif";
+
+/* how each logged decision reason renders in the prompt log */
+const REASON = {
+  delivered: { dot: C.maroon,    text: "delivered" },
+  defercap:  { dot: C.maroonMid, text: "delivered · defer cap" },
+  floor:     { dot: C.maroonDk,  text: "hard floor · override" },
+  deferred:  { dot: C.maroonLt,  text: "deferred · low receptivity" },
+  cooldown:  { dot: C.grey,      text: "held · cooldown" },
+  nowindow:  { dot: C.greyLt,    text: "no prompt · below window" },
+};
+
+function Label({ children, tone = C.maroon }) {
+  return (
+    <div style={{
+      fontSize: 10.5, fontWeight: 700, letterSpacing: "0.09em",
+      textTransform: "uppercase", color: tone, marginBottom: 9,
+    }}>{children}</div>
+  );
+}
+
+function Tag({ children, bg = C.maroonLt, fg = C.white }) {
+  return (
+    <span style={{
+      background: bg, color: fg, fontSize: 8.5, fontWeight: 700,
+      letterSpacing: "0.06em", textTransform: "uppercase",
+      padding: "2.5px 7px", borderRadius: 999, whiteSpace: "nowrap",
+    }}>{children}</span>
+  );
+}
+
+/* ---------- the deficit trace -------------------------------------------- */
+function DeficitTrace({ res }) {
+  const W = 760, H = 300;
+  const PL = 6, PR = 6, PT = 10, PB = 30;
+  const x1 = W - PR, y1 = H - PB;
+
+  const peakPct = Math.max(...res.trace.map((r) => r.pctBM));
+  const maxY = Math.max(2.35, peakPct * 1.14);
+
+  const X = (t) => PL + ((t - T0) / (T1 - T0)) * (x1 - PL);
+  const Y = (p) => y1 - (p / maxY) * (y1 - PT);
+
+  const path = res.trace
+    .map((r, i) => `${i ? "L" : "M"}${X(r.t).toFixed(1)},${Y(r.pctBM).toFixed(1)}`)
+    .join(" ");
+
+  const marks = res.events.filter((e) => e.kind !== "drink");
+  const at = (t) => res.trace[Math.max(0, Math.min(res.trace.length - 1, t - T0))];
+
+  return (
+    <div style={{ height: PANEL_H, display: "flex", alignItems: "center" }}>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+      <rect x={PL} y={PT} width={x1 - PL} height={y1 - PT} fill={C.blush} />
+
+      {/* above the hard floor is the override region */}
+      <rect x={PL} y={PT} width={x1 - PL} height={Math.max(0, Y(2) - PT)} fill={C.maroonDk} opacity="0.05" />
+
+      {/* thresholds — the window label drops below its line when the two crowd */}
+      <line x1={PL} x2={x1} y1={Y(2)} y2={Y(2)} stroke={C.maroonDk} strokeWidth="1.4" strokeDasharray="6 4" />
+      <text x={x1 - 8} y={Y(2) - 6} textAnchor="end" fontSize="10" fontWeight="700" fill={C.maroonDk}>hard floor  2 %</text>
+      <line x1={PL} x2={x1} y1={Y(0.5)} y2={Y(0.5)} stroke={C.maroonLt} strokeWidth="1.2" strokeDasharray="6 4" />
+      <text x={x1 - 8} y={Y(0.5) + (Y(0.5) - Y(2) < 22 ? 14 : -6)} textAnchor="end"
+        fontSize="10" fontWeight="700" fill={C.maroonLt}>window  0.5 %</text>
+
+      {/* series */}
+      <path d={path} fill="none" stroke={C.maroonDk} strokeWidth="2.4" strokeLinejoin="round" />
+
+      {/* prompt markers */}
+      {marks.map((e, i) => {
+        const p = at(e.t).pctBM;
+        return (
+          <g key={i}>
+            <line x1={X(e.t)} x2={X(e.t)} y1={Y(p) + 7} y2={y1}
+              stroke={e.kind === "floor" ? C.maroonDk : C.maroon}
+              strokeWidth="1" strokeDasharray="3 3" />
+            <circle cx={X(e.t)} cy={Y(p)} r="6"
+              fill={e.kind === "floor" ? C.maroonDk : C.white}
+              stroke={e.kind === "floor" ? C.maroonDk : C.maroon} strokeWidth="2" />
+          </g>
+        );
+      })}
+
+      {/* legend */}
+      <g>
+        <rect x={PL + 10} y={PT + 8} width="132" height="22" rx="11" fill={C.white} />
+        <circle cx={PL + 24} cy={PT + 19} r="4" fill={C.white} stroke={C.maroon} strokeWidth="1.6" />
+        <text x={PL + 34} y={PT + 23} fontSize="9.5" fontWeight="700" fill={C.maroon}>prompt delivered</text>
+      </g>
+
+      {/* time axis — first and last labels tuck inside the plot edge */}
+      {[6, 10, 14, 18, 22].map((h, i, a) => (
+        <text key={h}
+          x={i === 0 ? PL + 2 : i === a.length - 1 ? x1 - 2 : X(h * 60)}
+          y={y1 + 19}
+          textAnchor={i === 0 ? "start" : i === a.length - 1 ? "end" : "middle"}
+          fontSize="9.5" fill={C.grey}>
+          {clock(h * 60)}
+        </text>
+      ))}
+    </svg>
+    </div>
+  );
+}
+
+/* ---------- intake log ---------------------------------------------------- */
+function IntakeLog({ res }) {
+  const drinks = res.events.filter((e) => e.kind === "drink");
+  return (
+    <div style={{ background: C.blush, padding: "4px 12px", height: PANEL_H, overflowY: "auto" }}>
+      {drinks.map((e, i) => (
+        <div key={i} style={{
+          display: "flex", alignItems: "center", gap: 10,
+          padding: "9px 0", borderBottom: `1px solid ${C.blush2}`,
+        }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: C.grey, width: 38 }}>{clock(e.t)}</span>
+          <span style={{ fontSize: 12.5, fontWeight: 700, color: C.maroonDk, flex: 1 }}>
+            {Math.round(e.ml)} mL
+          </span>
+          <Tag>bottle</Tag>
+        </div>
+      ))}
+      {drinks.length === 0 && (
+        <div style={{ fontSize: 11.5, color: C.grey, padding: "14px 0" }}>no intake recorded</div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- prompt log ---------------------------------------------------- */
+function PromptLog({ res }) {
+  return (
+    <div style={{ background: C.blush, padding: "4px 12px", height: PANEL_H, overflowY: "auto" }}>
+      {res.decisions.map((d, i) => {
+        const r = REASON[d.reason] || REASON.nowindow;
+        const suffix = d.fired ? (d.drank ? " · drank" : " · no drink") : "";
+        return (
+          <div key={i} style={{
+            display: "flex", alignItems: "center", gap: 9,
+            padding: "9px 0", borderBottom: `1px solid ${C.blush2}`,
+          }}>
+            <span style={{
+              width: 9, height: 9, borderRadius: "50%", background: r.dot, flexShrink: 0,
+            }} />
+            <span style={{ fontSize: 11, fontWeight: 700, color: C.grey, width: 38 }}>{clock(d.t)}</span>
+            <span style={{ fontSize: 11, fontWeight: 700, color: C.maroonDk, lineHeight: 1.3 }}>
+              {r.text}{suffix}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------- controls ------------------------------------------------------ */
 function Slider({ label, value, set, min, max, step, unit }) {
   return (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
-        <span style={{ fontSize: 12.5, color: C.ink }}>{label}</span>
-        <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: C.muted }}>
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 5 }}>
+        <span style={{ fontSize: 11.5, color: C.ink }}>{label}</span>
+        <span style={{ fontSize: 11.5, fontWeight: 700, color: C.maroon }}>
           {typeof value === "number" && value % 1 !== 0 ? value.toFixed(3) : value}{unit}
         </span>
       </div>
-      <input
-        type="range" min={min} max={max} step={step} value={value}
-        onChange={(e) => set(parseFloat(e.target.value))}
-        style={{ width: "100%", accentColor: C.deficit }}
-      />
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={(e) => set(parseFloat(e.target.value))} style={{ width: "100%" }} />
     </div>
   );
 }
 
-function Metric({ label, value, unit, tone }) {
+const signed = (n) => (n > 0 ? "+" : n < 0 ? "\u2212" : "") + Math.abs(n);
+
+function Stat({ label, value, unit, tone = C.maroonDk }) {
   return (
-    <div style={{ flex: 1, minWidth: 96 }}>
-      <div style={{ fontSize: 11.5, color: C.muted, marginBottom: 3 }}>{label}</div>
-      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 22, color: tone || C.ink, lineHeight: 1.1 }}>
-        {value}<span style={{ fontSize: 12, color: C.muted, marginLeft: 2 }}>{unit}</span>
+    <div style={{ background: C.blush, padding: "13px 15px", borderRadius: 3, flex: "1 1 150px" }}>
+      <div style={{ fontFamily: SERIF, fontSize: 21, fontWeight: 700, color: tone, lineHeight: 1.1 }}>
+        {value}<span style={{ fontSize: 11, fontFamily: SANS, color: C.grey, marginLeft: 3 }}>{unit}</span>
       </div>
+      <div style={{
+        fontSize: 9.5, fontWeight: 700, letterSpacing: "0.07em",
+        textTransform: "uppercase", color: C.grey, marginTop: 5,
+      }}>{label}</div>
     </div>
   );
 }
 
-/* deficit trace with prompt / drink markers */
-function Trace({ res, cfg, color, title, subtitle }) {
-  const W = 760, H = 190, PADL = 46, PADB = 26, PADT = 14, PADR = 10;
-  const maxY = Math.max(cfg.bodyMass * 1000 * 0.025, res.peak * 1.1);
-  const x = (t) => PADL + ((t - T0) / (T1 - T0)) * (W - PADL - PADR);
-  const y = (v) => PADT + (1 - v / maxY) * (H - PADT - PADB);
-
-  const path = res.trace.map((r, i) => `${i ? "L" : "M"}${x(r.t).toFixed(1)},${y(r.deficit).toFixed(1)}`).join(" ");
-  const area = `${path} L${x(T1)},${y(0)} L${x(T0)},${y(0)} Z`;
-  const floorY = y(cfg.bodyMass * 1000 * 0.02);
-  const warnY = y(cfg.bodyMass * 1000 * 0.01);
-
-  return (
-    <div style={{ background: C.panel, border: `1px solid ${C.hair}`, padding: "14px 16px 8px", marginBottom: 14 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
-        <div>
-          <span style={{ fontSize: 14.5, fontWeight: 600, color: color }}>{title}</span>
-          <span style={{ fontSize: 12, color: C.muted, marginLeft: 10 }}>{subtitle}</span>
-        </div>
-        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5, color: C.muted }}>
-          {res.prompts} prompts · {(res.responseRate * 100).toFixed(0)}% answered
-        </div>
-      </div>
-
-      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
-        {/* threshold bands */}
-        <rect x={PADL} y={PADT} width={W - PADL - PADR} height={Math.max(0, floorY - PADT)} fill={C.floor} opacity={0.055} />
-        <line x1={PADL} x2={W - PADR} y1={floorY} y2={floorY} stroke={C.floor} strokeWidth="1" strokeDasharray="4 3" />
-        <line x1={PADL} x2={W - PADR} y1={warnY} y2={warnY} stroke={C.muted} strokeWidth="0.7" strokeDasharray="2 4" />
-        <text x={W - PADR} y={floorY - 4} textAnchor="end" fontSize="9.5" fill={C.floor} fontFamily="'IBM Plex Mono', monospace">2% BM — hard floor</text>
-        <text x={W - PADR} y={warnY - 4} textAnchor="end" fontSize="9.5" fill={C.muted} fontFamily="'IBM Plex Mono', monospace">1% BM</text>
-
-        {/* deficit */}
-        <path d={area} fill={color} opacity={0.13} />
-        <path d={path} fill="none" stroke={color} strokeWidth="1.7" />
-
-        {/* events */}
-        {res.events.map((e, i) =>
-          e.kind === "drink" ? (
-            <circle key={i} cx={x(e.t)} cy={H - PADB + 6} r="2" fill={C.drink} />
-          ) : (
-            <line key={i} x1={x(e.t)} x2={x(e.t)} y1={PADT} y2={H - PADB}
-              stroke={e.kind === "floor" ? C.floor : color}
-              strokeWidth={e.kind === "floor" ? 1.6 : 0.9}
-              opacity={e.kind === "floor" ? 0.85 : 0.42} />
-          )
-        )}
-
-        {/* axes */}
-        <line x1={PADL} x2={W - PADR} y1={H - PADB} y2={H - PADB} stroke={C.hair} />
-        {[6, 9, 12, 15, 18, 21].map((h) => (
-          <g key={h}>
-            <line x1={x(h * 60)} x2={x(h * 60)} y1={H - PADB} y2={H - PADB + 3} stroke={C.hair} />
-            <text x={x(h * 60)} y={H - PADB + 15} textAnchor="middle" fontSize="10" fill={C.muted} fontFamily="'IBM Plex Mono', monospace">{h}:00</text>
-          </g>
-        ))}
-        {[0, 0.5, 1].map((f) => (
-          <text key={f} x={PADL - 6} y={y(maxY * f) + 3} textAnchor="end" fontSize="10" fill={C.muted} fontFamily="'IBM Plex Mono', monospace">
-            {Math.round(maxY * f)}
-          </text>
-        ))}
-        <text x={PADL - 6} y={PADT - 3} textAnchor="end" fontSize="9" fill={C.muted}>mL</text>
-      </svg>
-    </div>
-  );
-}
-
+/* ============================== PAGE ===================================== */
 export default function HydrationSliceDemo() {
   const [bodyMass, setBodyMass] = useState(70);
   const [peakTemp, setPeakTemp] = useState(34);
@@ -316,98 +442,160 @@ export default function HydrationSliceDemo() {
   const [recThreshold, setRecThreshold] = useState(0.45);
   const [seed, setSeed] = useState(7);
 
-  const cfg = {
-    bodyMass, base: 0.10, k, a: 0.022, h: 0.5,
-    needThresholdML: bodyMass * 1000 * 0.008,
-    cooldown: 40, maxDefer: 90, floorCooldown: 20,
-    recThreshold,
-    hourlyTargetML: 240,
-    baseHazard: 0.006, promptEffect, sipML: 190, trainingDrinkMult: 1.4,
-  };
-
-  const { adaptive, baseline, day, violations } = useMemo(() => {
+  const { adaptive, baseline, violations } = useMemo(() => {
+    const cfg = {
+      bodyMass, base: 0.10, k, a: 0.022, h: 0.5,
+      needThresholdML: bodyMass * 1000 * 0.008,
+      cooldown: 40, maxDefer: 90, floorCooldown: 20,
+      recThreshold,
+      hourlyTargetML: 240,
+      baseHazard: 0.006, promptEffect, sipML: 190, trainingDrinkMult: 1.4,
+    };
     const rng = makeRng(seed * 31 + 5);
     const d = buildDay({ trainStart: 17 * 60, trainLen: 75, peakTemp, humidity, rng });
     const a = simulate(d, cfg, "adaptive", seed);
     const b = simulate(d, cfg, "baseline", seed);
-    return { adaptive: a, baseline: b, day: d, violations: checkInvariant(a, cfg) };
+    return { adaptive: a, baseline: b, violations: checkInvariant(a, cfg) };
   }, [bodyMass, peakTemp, humidity, k, promptEffect, recThreshold, seed]);
 
   const delta = baseline.timeInDeficit - adaptive.timeInDeficit;
   const promptDelta = baseline.prompts - adaptive.prompts;
 
   return (
-    <div style={{ background: C.ground, minHeight: "100%", padding: "22px 20px 30px", color: C.ink,
-                  fontFamily: "'IBM Plex Sans', system-ui, sans-serif" }}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
-        input[type=range]{height:3px;background:${C.hair};border-radius:2px;outline:none;-webkit-appearance:none}
-        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:${C.deficit};cursor:pointer}
-        input[type=range]:focus-visible{outline:2px solid ${C.deficit};outline-offset:3px}`}</style>
+    <div style={{ background: C.white, minHeight: "100%", color: C.ink, fontFamily: SANS }}>
+      <style>{`
+        .dash-grid { display: grid; gap: 18px;
+          grid-template-columns: minmax(0,2.45fr) minmax(0,1fr) minmax(0,1.06fr); }
+        .lower-grid { display: grid; gap: 18px; grid-template-columns: 268px minmax(0,1fr); }
+        @media (max-width: 980px) {
+          .dash-grid, .lower-grid { grid-template-columns: 1fr; }
+        }
+        input[type=range] { height: 3px; background: ${C.blush2}; border-radius: 2px;
+          outline: none; -webkit-appearance: none; appearance: none; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 13px;
+          height: 13px; border-radius: 50%; background: ${C.maroon}; cursor: pointer; }
+        input[type=range]::-moz-range-thumb { width: 13px; height: 13px; border: none;
+          border-radius: 50%; background: ${C.maroon}; cursor: pointer; }
+        input[type=range]:focus-visible { outline: 2px solid ${C.maroon}; outline-offset: 3px; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: ${C.blush2}; border-radius: 3px; }
+      `}</style>
 
-      <div style={{ maxWidth: 1180, margin: "0 auto" }}>
-        <div style={{ marginBottom: 4, fontSize: 21, fontWeight: 600, letterSpacing: "-0.01em" }}>
-          Deficit-triggered vs. volume-lapse prompting
+      <div style={{ maxWidth: 1240, margin: "0 auto", padding: "30px 24px 44px" }}>
+
+        {/* ---- page heading ---- */}
+        <div style={{
+          fontSize: 10.5, fontWeight: 700, letterSpacing: "0.09em",
+          textTransform: "uppercase", color: C.maroonLt, marginBottom: 7,
+        }}>
+          Vertical slice · synthetic subject · one day
         </div>
-        <div style={{ fontSize: 13.5, color: C.muted, marginBottom: 20, maxWidth: 720, lineHeight: 1.5 }}>
-          One simulated day, one subject, identical drinking behaviour under both policies (common random numbers).
-          The only difference is what decides when to prompt.
-        </div>
+        <h1 style={{
+          fontFamily: SERIF, fontSize: 34, fontWeight: 400, color: C.maroonDk,
+          margin: "0 0 10px", letterSpacing: "-0.01em",
+        }}>
+          Hydration dashboard
+        </h1>
+        <div style={{ height: 1.5, background: C.blush2, marginBottom: 22 }} />
 
-        <div style={{ display: "flex", gap: 18, alignItems: "flex-start", flexWrap: "wrap" }}>
-          {/* controls */}
-          <div style={{ width: 250, background: C.panel, border: `1px solid ${C.hair}`, padding: "16px 16px 8px" }}>
-            <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 12 }}>Subject &amp; conditions</div>
-            <Slider label="Body mass" value={bodyMass} set={setBodyMass} min={50} max={95} step={1} unit=" kg" />
-            <Slider label="Peak ambient temp" value={peakTemp} set={setPeakTemp} min={24} max={42} step={0.5} unit=" °C" />
-            <Slider label="Relative humidity" value={humidity} set={setHumidity} min={25} max={90} step={1} unit=" %" />
-            <Slider label="Sweat coefficient k" value={k} set={setK} min={0.06} max={0.26} step={0.005} unit="" />
-
-            <div style={{ borderTop: `1px solid ${C.hair}`, margin: "14px 0 13px" }} />
-            <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 12 }}>Policy &amp; behaviour</div>
-            <Slider label="Prompt effect size" value={promptEffect} set={setPromptEffect} min={0} max={0.16} step={0.005} unit="" />
-            <Slider label="Receptivity threshold θ" value={recThreshold} set={setRecThreshold} min={0} max={0.9} step={0.05} unit="" />
-            <Slider label="Random seed" value={seed} set={setSeed} min={1} max={40} step={1} unit="" />
+        {/* ---- the dashboard ---- */}
+        <div style={{ border: `1px solid ${C.greyLt}`, borderRadius: 4, overflow: "hidden" }}>
+          <div style={{
+            background: C.maroonDk, padding: "11px 18px", display: "flex",
+            justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10,
+          }}>
+            <div style={{
+              fontSize: 12, fontWeight: 700, color: C.white, letterSpacing: "0.05em",
+              textTransform: "uppercase",
+            }}>
+              Hydration &nbsp;·&nbsp; synthetic subject &nbsp;·&nbsp; seed {seed}
+            </div>
+            <div style={{ fontSize: 11.5, fontWeight: 700, color: C.rose }}>
+              deficit&nbsp; {adaptive.finalPctBM.toFixed(2)} % BM
+              &nbsp;&nbsp;&nbsp;&nbsp;
+              intake&nbsp; {Math.round(adaptive.intakeTotal).toLocaleString()} mL
+            </div>
           </div>
 
-          {/* traces */}
-          <div style={{ flex: 1, minWidth: 480 }}>
-            <Trace res={adaptive} cfg={cfg} color={C.adaptive}
-              title="Adaptive" subtitle="need gate + receptivity timing + hard floor" />
-            <Trace res={baseline} cfg={cfg} color={C.baseline}
-              title="Baseline" subtitle="hourly volume-lapse (sipIT-style rule)" />
+          <div className="dash-grid" style={{ padding: "16px 18px 18px" }}>
+            <div>
+              <Label>Deficit trace</Label>
+              <DeficitTrace res={adaptive} />
+            </div>
+            <div>
+              <Label>Intake log</Label>
+              <IntakeLog res={adaptive} />
+            </div>
+            <div>
+              <Label>Prompt log</Label>
+              <PromptLog res={adaptive} />
+            </div>
+          </div>
+        </div>
 
-            {/* comparison */}
-            <div style={{ background: C.panel, border: `1px solid ${C.hair}`, padding: "16px 18px" }}>
-              <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 16 }}>
-                <Metric label="Time in deficit — adaptive" value={adaptive.timeInDeficit} unit=" min" tone={C.adaptive} />
-                <Metric label="Time in deficit — baseline" value={baseline.timeInDeficit} unit=" min" tone={C.baseline} />
-                <Metric label="Difference" value={(delta > 0 ? "−" : "+") + Math.abs(delta)} unit=" min"
-                        tone={delta > 0 ? C.adaptive : C.floor} />
-                <Metric label="Prompts saved" value={(promptDelta >= 0 ? "" : "+") + promptDelta} unit="" />
-                <Metric label="Peak deficit — adaptive" value={(adaptive.peak / (bodyMass * 10)).toFixed(2)} unit=" % BM" />
-                <Metric label="Peak deficit — baseline" value={(baseline.peak / (bodyMass * 10)).toFixed(2)} unit=" % BM" />
-              </div>
+        <div style={{
+          background: C.maroon, color: C.white, textAlign: "center",
+          padding: "13px 18px", marginTop: 10, borderRadius: 4,
+          fontSize: 12.5, fontStyle: "italic",
+        }}>
+          Deficit trace · intake log · prompt log. A five-panel dashboard is not graded and consumes weeks.
+        </div>
 
-              <div style={{ borderTop: `1px solid ${C.hair}`, paddingTop: 13, display: "flex",
-                            justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-                <div style={{ fontSize: 12.5, color: C.muted, maxWidth: 560, lineHeight: 1.5 }}>
-                  Set prompt effect to 0 and the two policies converge — the difference is entirely in <em>when</em> a
-                  prompt lands, not in the drinking model. Raise humidity to widen the gap.
-                </div>
-                <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5,
-                              color: violations === 0 ? C.adaptive : C.floor, whiteSpace: "nowrap" }}>
-                  invariant: {violations === 0 ? "PASS" : `FAIL (${violations})`}
-                  <span style={{ color: C.muted }}> · floor fired {adaptive.floorFires}×</span>
-                </div>
-              </div>
+        {/* ---- controls and the RQ4 comparison ---- */}
+        <div className="lower-grid" style={{ marginTop: 26 }}>
+          <div style={{ border: `1px solid ${C.blush2}`, borderRadius: 4, padding: "16px 16px 18px" }}>
+            <Label>Subject &amp; conditions</Label>
+            <div style={{ display: "grid", gap: 13 }}>
+              <Slider label="Body mass" value={bodyMass} set={setBodyMass} min={50} max={95} step={1} unit=" kg" />
+              <Slider label="Peak ambient temp" value={peakTemp} set={setPeakTemp} min={24} max={42} step={0.5} unit=" °C" />
+              <Slider label="Relative humidity" value={humidity} set={setHumidity} min={25} max={90} step={1} unit=" %" />
+              <Slider label="Sweat coefficient k" value={k} set={setK} min={0.06} max={0.26} step={0.005} unit="" />
+            </div>
+            <div style={{ height: 1, background: C.blush2, margin: "16px 0 14px" }} />
+            <Label>Policy &amp; behaviour</Label>
+            <div style={{ display: "grid", gap: 13 }}>
+              <Slider label="Prompt effect size" value={promptEffect} set={setPromptEffect} min={0} max={0.16} step={0.005} unit="" />
+              <Slider label="Receptivity threshold θ" value={recThreshold} set={setRecThreshold} min={0} max={0.9} step={0.05} unit="" />
+              <Slider label="Random seed" value={seed} set={setSeed} min={1} max={40} step={1} unit="" />
+            </div>
+          </div>
+
+          <div>
+            <Label>RQ4 shape — deficit-triggered vs. lapse-contingent</Label>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <Stat label="Time in deficit — adaptive" value={adaptive.timeInDeficit} unit="min" tone={C.maroon} />
+              <Stat label="Time in deficit — baseline" value={baseline.timeInDeficit} unit="min" tone={C.grey} />
+              <Stat label="Difference" value={(delta > 0 ? "−" : "+") + Math.abs(delta)} unit="min"
+                tone={delta > 0 ? C.maroon : C.gold} />
+              <Stat label="Prompts saved" value={signed(promptDelta)} unit="" />
+            </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
+              <Stat label="Peak deficit — adaptive" value={(adaptive.peak / (bodyMass * 10)).toFixed(2)} unit="% BM" />
+              <Stat label="Peak deficit — baseline" value={(baseline.peak / (bodyMass * 10)).toFixed(2)} unit="% BM" />
+              <Stat label="Prompts delivered" value={adaptive.prompts} unit="" />
+              <Stat label="Hard floor fired" value={adaptive.floorFires} unit="×" tone={C.maroonDk} />
             </div>
 
-            <div style={{ marginTop: 14, fontSize: 11.5, color: C.muted, lineHeight: 1.6 }}>
-              <strong style={{ color: C.ink, fontWeight: 600 }}>Not yet implemented.</strong>{" "}
-              Sweat rate uses a transparent stand-in, not the published heat-balance equation. Receptivity is a
-              fixed heuristic with no learning. No real sensor input, signal-quality gating, firmware, or
-              micro-randomisation. Prompt effect size is a free parameter, which is why it is a slider rather
-              than a constant.
+            <div style={{
+              marginTop: 12, padding: "13px 15px", borderRadius: 4,
+              background: violations === 0 ? C.maroonDk : C.gold, color: C.white,
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              gap: 14, flexWrap: "wrap",
+            }}>
+              <span style={{ fontSize: 12 }}>
+                Low receptivity may <strong>delay</strong> a need-driven prompt. It may never <strong>cancel</strong> one.
+              </span>
+              <span style={{ fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap" }}>
+                invariant I2: {violations === 0 ? "PASS" : `FAIL (${violations})`}
+              </span>
+            </div>
+
+            <div style={{ marginTop: 14, fontSize: 11.5, color: C.grey, lineHeight: 1.65 }}>
+              <strong style={{ color: C.maroonDk }}>Not yet implemented.</strong>{" "}
+              Sweat rate uses a transparent stand-in, not the published heat-balance equation. Receptivity is
+              a fixed heuristic with no learning. No real sensor input, signal-quality gating, firmware,
+              micro-randomisation, or manual intake entry. Prompt effect size is a free parameter, which is
+              why it is a slider rather than a constant.
             </div>
           </div>
         </div>
